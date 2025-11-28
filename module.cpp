@@ -5,6 +5,7 @@
 #include <sys/time.h>
 #include <vector>
 #include <immintrin.h>
+#include <cstdio>
 
 // Uncomment for ISPC
 //#include "module_ispc.h"
@@ -20,6 +21,7 @@ inline float twoDimRead(std::vector<float> &tensor, int &x, int &y, const int &s
     return tensor[x * (sizeX)+ y];
 }
 
+// overwrite the value at (x, y) with val
 inline void twoDimWrite(std::vector<float> &tensor, int &x, int &y, const int &sizeX, float &val) {
     tensor[x * (sizeX) + y] = val;
 }
@@ -30,6 +32,7 @@ inline float fourDimRead(std::vector<float> &tensor, int &x, int &y, int &z, int
     return tensor[x * (sizeX * sizeY * sizeZ) + y * (sizeY * sizeZ) + z * (sizeZ) + b];
 }
 
+// overwrite the value at (x, y, z, b) with val instead of adding val to the original value
 inline void fourDimWrite(std::vector<float> &tensor, int &x, int &y, int &z, int &b,
         const int &sizeX, const int &sizeY, const int &sizeZ, float &val) {
     tensor[x * (sizeX * sizeY * sizeZ) + y * (sizeY * sizeZ) + z * (sizeZ) + b] = val;
@@ -194,6 +197,165 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
 }
 
+// Calculate AB = A * B = C
+// 2D tensor * 4D tensor = 4D tensor
+// A_y != B_x
+// A (x, z), B (z, y), C (x, y).
+void vecAB(std::vector<float> &CVec, std::vector<float> &AVec, std::vector<float> &BVec,
+        int A_x, int A_y, int B_x, int B_y, int x, int y, int z,
+        int B, int H, int N, int d) {
+    int Ax, Ay, Bx, By;
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < x; i++) {
+                Ax = A_x + i;
+                for (int j = 0; j < y; j++) {
+                    Bx = B_x + j;
+                    float val = 0.0f;
+                    // Don't think there would be much performance boost to read one tensor
+                    // at a time. So just read tensors together.
+                    for (int k = 0; k < z; k++) {
+                        int yi = A_y + k;
+                        int xj = B_x + k;
+                        float A_ik = twoDimRead(AVec, Ax, yi, N);
+                        float B_kj = fourDimRead(BVec, b, h, xj, Bx, H, N, d);
+                        val += A_ik * B_kj;
+                    }
+                    fourDimWrite(CVec, b, h, Ax, Bx, H, N, d, val);
+                }
+            }
+        }
+    }
+}
+
+// two 4D tensors
+// B_t is the transpose of B
+// A (x, z), B (z, y), C (x, y).
+// B_t (y, z)
+void vecAB_tUpdate(std::vector<float> &CVec, std::vector<float> &AVec, std::vector<float> &BVec,
+        int A_x, int A_y, int B_x, int B_y, int x, int y, int z,
+        int B, int H, int N, int d) {
+    int Ax, Ay, Bx, By;
+    float old;
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            for (int i = 0; i < x; i++) {
+                Ax = A_x + i;
+                for (int j = 0; j < y; j++) {
+                    Bx = B_x + j;
+                    float val = 0.0;
+                    // Don't think there would be much performance boost to read one tensor
+                    // at a time. So just read tensors together.
+                    for (int k = 0; k < z; k++) {
+                        int yi = A_y + k;
+                        int xj = B_y + k;
+                        float A_ik = fourDimRead(AVec, b, h, Ax, yi, H, N, d);
+                        float B_jk = fourDimRead(BVec, b, h, Bx, xj, H, N, d);
+                        val += A_ik * B_jk;
+                    }
+                    // Adding old values to vals is not allowed
+                    old = twoDimRead(CVec, Ax, Bx, N);
+                    val += old;
+                    if (h == 0 && b == 0) {
+                        //printf("bar C(%d, %d) = val %f\n", Ax, Bx, val);
+                        twoDimWrite(CVec, Ax, Bx, N, val);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void vecAB_tTile(std::vector<float> &CVec, std::vector<float> &AVec, std::vector<float> &BVec,
+        int Ax, int Ay, int Bx, int By, int x, int y, int z,
+        int B, int H, int N, int d, int NR) {
+    int A_x, A_y, B_x, B_y;
+    int L_i = x / NR;
+    int L_j = z / NR;
+    int L_k = y / NR;
+
+    //printf("foo Shapes x %d y%d z %d\n", x, y, z);
+    //printf("foo Main: A(%d + %d, %d + %d) * B(%d + %d, %d + %d)\n",
+    //        Ax, x, Ay, z, Bx, y, By, z);
+
+    if (x > NR) {
+        x = NR;
+    }
+
+    if (y > NR) {
+        y = NR;
+    }
+
+    if (z > NR) {
+        z = NR;
+    }
+
+    for (int i = 0; i < L_i; i++) {
+        A_x = Ax + NR * i;
+        for (int k = 0; k < L_k; k++) {
+            B_x = Bx + NR * k;
+            for (int j = 0; j < L_j; j++) {
+                A_y = Ay + NR * j;
+                B_y = By + NR * j;
+                // Iterate over z points
+                //printf("foo A(%d, %d); B(%d, %d)\n",
+                //        A_x, A_y, B_x, B_y);
+                //printf("foo A(%d + %d, %d + %d) * B(%d + %d, %d + %d)\n",
+                //        A_x, x, A_y, z, B_x, y, B_y, z);
+                vecAB_tUpdate(CVec, AVec, BVec, A_x, A_y, B_x, B_y, x, y, z, B, H, N, d);
+            }
+        }
+    }
+}
+
+void vecAB_tBlocked(std::vector<float> &CVec, std::vector<float> &AVec,
+        std::vector<float> &BVec, int x, int y, int z,
+        int B, int H, int N, int d) {
+    int A_x, A_y, B_x, B_y;
+    // Assume 4 byte float, 64 byte cache lines as well as N and d are very large
+    // int L = 64;
+    // number of floats in a cache line
+    // int NR = L / sizeof(float);
+    int NR = 32; // for simplicity, set NR to 16
+
+    // Blocked matrix multiplication
+    // Assume:
+    // A, shape (x:i, z:j); B, shape (z:j, y:k); C, shape (x:i, y:k);
+    // i = L + r1; j = L + r2; k = L + r3 where r1 < L, r2 < L, r3 < L.
+    // Then:
+    // C_ik = A_ij * B_jk
+    // C_(L+r1)(L+r3) = A_(L+r1)(L+r2) * B_(L+r2)(L+r3)
+    //                = [A_LL   A_Lr2] *  [B_LL   B_Lr3]
+    //                   A_r1L  A_r1r2     B_r2L  B_r2r3
+    int L_i = x / NR;
+    int r1_i = x % NR;
+    int L_j = z / NR;
+    int r2_j = z % NR;
+    int L_k = y / NR;
+    int r3_k = y % NR;
+    A_y = z - r2_j;
+    B_x = y - r3_k;
+    A_x = x - r1_i;
+    //printf("Shapes N %d x d %d B %d H %d\n", N, d, B, H);
+    //printf("z:A_y: %d, y:B_x: %d, x:A_x: %d\n", A_y, B_x, A_x);
+    //printf("r1_i: %d, r2_j: %d, r3_k: %d\n", r1_i, r2_j, r3_k);
+
+    // CLL = A_LL * B_LL + A_Lr2 * B_r2L
+    vecAB_tTile(CVec, AVec, BVec, 0, 0, 0, 0, A_x, B_x, A_y, B, H, N, d, NR);
+    vecAB_tTile(CVec, AVec, BVec, 0, A_y, 0, A_y, A_x, B_x, r2_j, B, H, N, d, NR);
+
+    // CLr3 = A_LL * B_Lr3 + A_Lr2 * B_r2r3
+    vecAB_tTile(CVec, AVec, BVec, 0, 0, B_x, 0, A_x, r3_k, A_y, B, H, N, d, NR);
+    vecAB_tTile(CVec, AVec, BVec, 0, A_y, B_x, A_y, A_x, r3_k, r2_j, B, H, N, d, NR);
+
+    // Cr1L = A_r1L * B_LL + A_r1r2 * B_r2L
+    vecAB_tTile(CVec, AVec, BVec, A_x, 0, 0, 0, r1_i, B_x, A_y, B, H, N, d, NR);
+    vecAB_tTile(CVec, AVec, BVec, A_x, A_y, 0, A_y, r1_i, B_x, r2_j, B, H, N, d, NR);
+
+    // Cr1r3 = A_r1L * B_Lr3 + A_r1r2 * B_r2r3
+    vecAB_tTile(CVec, AVec, BVec, A_x, 0, B_x, 0, r1_i, r3_k, A_y, B, H, N, d, NR);
+    vecAB_tUpdate(CVec, AVec, BVec, A_x, A_y, B_x, B_y, r1_i, r3_k, r2_j, B, H, N, d);
+}
 
 // ---------------------------------------------------------- //
 //     PART 2: BLOCKED MATRIX MULTIPLY AND UNFUSED SOFTMAX    //
@@ -218,6 +380,24 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
+    //vecAB_tUpdate(QK_t, Q, K, 0, 0, 0, 0, N, N, d, B, H, N, d);
+    vecAB_tBlocked(QK_t, Q, K, N, N, d, B, H, N, d);
+
+    for (int i = 0; i < N; i++) {
+        float S_i = 0.0;
+        for (int j = 0; j < N; j++) {
+            float S_ij = std::exp(twoDimRead(QK_t, i, j, N));
+            S_i += S_ij;
+            twoDimWrite(QK_t, i, j, N, S_ij);
+        }
+
+        for (int j = 0; j < N; j++) {
+            float P_ij = twoDimRead(QK_t, i, j, N) / S_i;
+            twoDimWrite(QK_t, i, j, N, P_ij);
+        }
+    }
+
+    vecAB(O, QK_t, V, 0, 0, 0, 0, N, d, N, B, H, N, d);
 
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
