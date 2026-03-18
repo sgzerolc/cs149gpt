@@ -5,6 +5,7 @@ python packages:
 Python 3.10
 torch==2.1.2
 setuptools==80.0.0
+numpy=1.26.4
 
 Warm-up:
 A 4-D tensor utilizes a row-major memory layout, where the inntermost dimension is stored
