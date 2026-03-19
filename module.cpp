@@ -46,6 +46,25 @@ std::vector<float> formatTensor(torch::Tensor tensor) {
     return vec;
 }
 
+/*
+ * P = softmax(S): N x N
+ */
+inline void twoDimSoftmax(std::vector<float> &P, int N) {
+    for (int i = 0; i < N; i++) {
+        float S_i = 0.0;
+        for (int j = 0; j < N; j++) {
+            float S_ij = std::exp(twoDimRead(P, i, j, N));
+            S_i += S_ij;
+            twoDimWrite(P, i, j, N, S_ij);
+        }
+
+        for (int j = 0; j < N; j++) {
+            float P_ij = twoDimRead(P, i, j, N) / S_i;
+            twoDimWrite(P, i, j, N, P_ij);
+        }
+    }
+}
+
 /* Programming Your Attention Modules.
  *
  * You are given Q, K, and V Tensors as inputs that are formatted as vectors. We have also created O and QK^t Tensors
@@ -158,19 +177,7 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
      * P[i, j] = exp(x_j)/sum(exp(x_0) + ... + exp(x_(n-1))) for i = 0 to N-1
      * P = P_i for i = 0 to n-1
      */
-    for (int i = 0; i < N; i++) {
-        float S_i = 0.0;
-        for (int j = 0; j < N; j++) {
-            float S_ij = std::exp(twoDimRead(QK_t, i, j, N));
-            S_i += S_ij;
-            twoDimWrite(QK_t, i, j, N, S_ij);
-        }
-
-        for (int j = 0; j < N; j++) {
-            float P_ij = twoDimRead(QK_t, i, j, N) / S_i;
-            twoDimWrite(QK_t, i, j, N, P_ij);
-        }
-    }
+    twoDimSoftmax(QK_t, N);
 
     /*
      * O = P * V, P (i, k), V (k, j)
@@ -380,22 +387,9 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
-    //vecAB_tUpdate(QK_t, Q, K, 0, 0, 0, 0, N, N, d, B, H, N, d);
     vecAB_tBlocked(QK_t, Q, K, N, N, d, B, H, N, d);
 
-    for (int i = 0; i < N; i++) {
-        float S_i = 0.0;
-        for (int j = 0; j < N; j++) {
-            float S_ij = std::exp(twoDimRead(QK_t, i, j, N));
-            S_i += S_ij;
-            twoDimWrite(QK_t, i, j, N, S_ij);
-        }
-
-        for (int j = 0; j < N; j++) {
-            float P_ij = twoDimRead(QK_t, i, j, N) / S_i;
-            twoDimWrite(QK_t, i, j, N, P_ij);
-        }
-    }
+    twoDimSoftmax(QK_t, N);
 
     vecAB(O, QK_t, V, 0, 0, 0, 0, N, d, N, B, H, N, d);
 
